@@ -230,8 +230,8 @@ def build_transport_set(
     filtered: Set[TransportKey] = set()
     for origin, destination, truck in transport:
         restricted = (
-            origin in origins
-            and is_one(origins[origin]["AccesoRestringido"])
+            origin in origins and
+            is_one(origins[origin]["AccesoRestringido"])
         )
         if restricted and not is_one(trucks[truck]["Urbano"]):
             continue
@@ -364,8 +364,8 @@ def create_flow_variables(
 
         for fraction in candidate_fractions:
             incompatible = (
-                destination in destinations
-                and compatibility.get(
+                destination in destinations and
+                compatibility.get(
                     (fraction, destination),
                     0,
                 ) != 1
@@ -494,10 +494,10 @@ def add_center_constraints(
     """Agrega conservación de flujo en centros."""
     for center, fraction in sorted(active_sf):
         problem += (
-            center_out_expr[center, fraction]
-            + discard_variables[center, fraction]
-            == performance[fraction, center]
-            * center_in_expr[center, fraction],
+            center_out_expr[center, fraction] +
+            discard_variables[center, fraction] ==
+            performance[fraction, center] *
+            center_in_expr[center, fraction],
             f"R4_Flujo_Centro_{center}_{fraction}",
         )
 
@@ -518,8 +518,8 @@ def add_destination_constraints(
         for fraction in fraction_ids:
             allowed = compatibility.get((fraction, destination), 0)
             problem += (
-                destination_in_expr[destination, fraction]
-                <= allowed * capacity[destination],
+                destination_in_expr[destination, fraction] <=
+                allowed * capacity[destination],
                 f"R5_Compatibilidad_{destination}_{fraction}",
             )
 
@@ -676,8 +676,8 @@ def build_model(data: Data):
         destination
         for destination in destination_ids
         if (
-            is_one(destinations[destination]["Contrato"])
-            or minimum[destination] > 0
+            is_one(destinations[destination]["Contrato"]) or
+            minimum[destination] > 0
         )
     }
 
@@ -754,8 +754,8 @@ def build_model(data: Data):
     )
 
     value_term = pulp.lpSum(
-        destination_value.get((fraction, destination), 0.0)
-        * destination_in_expr[destination, fraction]
+        destination_value.get((fraction, destination), 0.0) *
+        destination_in_expr[destination, fraction]
         for destination in destination_ids
         for fraction in fraction_ids
     )
@@ -780,10 +780,10 @@ def build_model(data: Data):
     )
 
     problem += (
-        value_term
-        + rep_term
-        - classification_term
-        - transport_term,
+        value_term +
+        rep_term -
+        classification_term -
+        transport_term,
         "Utilidad_Total",
     )
 
@@ -815,9 +815,9 @@ def build_model(data: Data):
     )
 
     total_emissions = pulp.lpSum(
-        variable
-        * emission_factor[truck]
-        * distance[origin, destination]
+        variable *
+        emission_factor[truck] *
+        distance[origin, destination]
         for (
             origin,
             destination,
@@ -939,7 +939,8 @@ def save_solution(
         objective = safe_value(problem.objective)
         emissions = safe_value(expressions["total_emissions"])
         collected = sum(
-            safe_value(value) for value in expressions["collected_expr"].values()
+            safe_value(value)
+            for value in expressions["collected_expr"].values()
         )
         total_offer = expressions["total_offer"]
         theta = expressions["theta"]

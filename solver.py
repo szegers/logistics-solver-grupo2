@@ -156,7 +156,7 @@ def build_transport_set(
     destinations: Dict[str, Row],
     trucks: Dict[str, Row],
 ) -> Set[TransportKey]:
-    """Construye T=(i,j,v) desde caminos.csv.
+    """Construye transport_set=(i,j,v) desde caminos.csv.
 
     Una fila con Centro genera dos tramos:
     Origen->Centro y Centro->Destino.
@@ -206,9 +206,12 @@ def build_transport_set(
     # En puntos restringidos solo se admite el tipo marcado como Urbano.
     filtered: Set[TransportKey] = set()
     for i, j, v in transport:
-        if i in origins and is_one(origins[i]["AccesoRestringido"]):
-            if not is_one(trucks[v]["Urbano"]):
-                continue
+        if (
+            i in origins
+            and is_one(origins[i]["AccesoRestringido"])
+            and not is_one(trucks[v]["Urbano"])
+        ):
+            continue
         filtered.add((i, j, v))
 
     return filtered
@@ -222,12 +225,12 @@ def build_model(data: Data):
     fractions = {r["FraccionID"]: r for r in data["fracciones.csv"]}
     trucks = {r["CamionID"]: r for r in data["camiones.csv"]}
 
-    P = list(origins)
-    S = list(centers)
-    D = list(destinations)
-    F = list(fractions)
+    point_ids = list(origins)
+    center_ids = list(centers)
+    destination_ids = list(destinations)
+    fraction_ids = list(fractions)
 
-    Q = {
+    offer = {
         (r["OrigenID"], r["FraccionID"]): as_float(
             r["Toneladas"],
             f"oferta.csv {r['OrigenID']}/{r['FraccionID']}",
@@ -277,11 +280,11 @@ def build_model(data: Data):
 
     beta = {
         f: as_float(fractions[f]["BonoREP"], f"BonoREP {f}")
-        for f in F
+        for f in fraction_ids
     }
     center_cost = {
         s: as_float(centers[s]["CostoManejo"], f"CostoManejo {s}")
-        for s in S
+        for s in center_ids
     }
     emission_factor = {
         v: as_float(trucks[v]["FactorEmision"], f"FactorEmision {v}")
@@ -292,25 +295,25 @@ def build_model(data: Data):
             destinations[d]["CapacidadRecepcion"],
             f"CapacidadRecepcion {d}",
         )
-        for d in D
+        for d in destination_ids
     }
     minimum = {
         d: as_float(destinations[d]["CuotaMinima"], f"CuotaMinima {d}")
-        for d in D
+        for d in destination_ids
     }
 
-    P_OBL = {
-        p for p in P if is_one(origins[p]["RetiroObligatorio"])
+    mandatory_origins = {
+        p for p in point_ids if is_one(origins[p]["RetiroObligatorio"])
     }
-    S_CERT = {
-        s for s in S if is_one(centers[s]["Certificado"])
+    certified_centers = {
+        s for s in center_ids if is_one(centers[s]["Certificado"])
     }
-    D_MIN = {
-        d for d in D
+    contract_destinations = {
+        d for d in destination_ids
         if is_one(destinations[d]["Contrato"]) or minimum[d] > 0
     }
 
-    contract_fractions = {d: set() for d in D}
+    contract_fractions = {d: set() for d in destination_ids}
     for r in data["fracciones_contrato.csv"]:
         d = r["DestinoID"]
         f = r["FraccionID"]
@@ -324,11 +327,11 @@ def build_model(data: Data):
             )
         contract_fractions[d].add(f)
 
-    T = build_transport_set(
+    transport_set = build_transport_set(
         data, origins, centers, destinations, trucks
     )
 
-    for i, j, v in T:
+    for i, j, v in transport_set:
         if (i, j, v) not in transport_cost:
             raise ValueError(
                 f"Falta costo de transporte para ({i}, {j}, {v})."
@@ -338,22 +341,22 @@ def build_model(data: Data):
                 f"Falta distancia para ({i}, {j})."
             )
 
-    offered_by_origin = {p: set() for p in P}
-    for (p, f), amount in Q.items():
+    offered_by_origin = {p: set() for p in point_ids}
+    for (p, f), amount in offer.items():
         if p not in origins or f not in fractions:
             raise ValueError(f"Oferta con clave desconocida: {p}/{f}.")
         if amount < 0:
             raise ValueError(f"Oferta negativa para {p}/{f}.")
         offered_by_origin[p].add(f)
 
-    fractions_at_center = {s: set() for s in S}
-    for p, s, _v in T:
+    fractions_at_center = {s: set() for s in center_ids}
+    for p, s, _v in transport_set:
         if p in origins and s in centers:
             fractions_at_center[s].update(offered_by_origin[p])
 
     active_sf = {
         (s, f)
-        for s in S
+        for s in center_ids
         for f in fractions_at_center[s]
     }
     for s, f in active_sf:
@@ -371,7 +374,7 @@ def build_model(data: Data):
     )
 
     x: Dict[FlowKey, pulp.LpVariable] = {}
-    for i, j, v in sorted(T):
+    for i, j, v in sorted(transport_set):
         if i in origins:
             candidate_fractions: Iterable[str] = offered_by_origin[i]
         elif i in centers:
@@ -399,40 +402,42 @@ def build_model(data: Data):
         return pulp.lpSum(
             variable
             for (i, j, f, _v), variable in x.items()
-            if (origin is None or i == origin)
-            and (destination is None or j == destination)
-            and (fraction is None or f == fraction)
+            if all((
+                origin is None or i == origin,
+                destination is None or j == destination,
+                fraction is None or f == fraction,
+            ))
         )
 
-    REC = {
+    collected_expr = {
         (p, f): flow_sum(origin=p, fraction=f)
-        for p, f in Q
+        for p, f in offer
     }
-    ING = {
+    center_in_expr = {
         (s, f): flow_sum(destination=s, fraction=f)
         for s, f in active_sf
     }
-    SAL = {
+    center_out_expr = {
         (s, f): flow_sum(origin=s, fraction=f)
         for s, f in active_sf
     }
-    ENT = {
+    destination_in_expr = {
         (d, f): flow_sum(destination=d, fraction=f)
-        for d in D for f in F
+        for d in destination_ids for f in fraction_ids
     }
 
     value_term = pulp.lpSum(
-        destination_value.get((f, d), 0.0) * ENT[d, f]
-        for d in D for f in F
+        destination_value.get((f, d), 0.0) * destination_in_expr[d, f]
+        for d in destination_ids for f in fraction_ids
     )
     rep_term = pulp.lpSum(
-        beta[f] * SAL[s, f]
-        for s in S_CERT
+        beta[f] * center_out_expr[s, f]
+        for s in certified_centers
         for f in fractions_at_center[s]
-        if (s, f) in SAL
+        if (s, f) in center_out_expr
     )
     classification_term = pulp.lpSum(
-        center_cost[s] * ING[s, f]
+        center_cost[s] * center_in_expr[s, f]
         for s, f in active_sf
     )
     transport_term = pulp.lpSum(
@@ -445,53 +450,54 @@ def build_model(data: Data):
     ), "Utilidad_Total"
 
     # R1: disponibilidad.
-    for (p, f), available in Q.items():
+    for (p, f), available in offer.items():
         problem += (
-            REC[p, f] <= available,
+            collected_expr[p, f] <= available,
             f"R1_Disponibilidad_{p}_{f}",
         )
 
     # R2: retiro total obligatorio.
-    for (p, f), available in Q.items():
-        if p in P_OBL:
+    for (p, f), available in offer.items():
+        if p in mandatory_origins:
             problem += (
-                REC[p, f] == available,
+                collected_expr[p, f] == available,
                 f"R2_Retiro_Obligatorio_{p}_{f}",
             )
 
     # R3: meta mínima REP.
-    total_offer = sum(Q.values())
+    total_offer = sum(offer.values())
     problem += (
-        pulp.lpSum(REC.values()) >= theta * total_offer,
+        pulp.lpSum(collected_expr.values()) >= theta * total_offer,
         "R3_Meta_REP",
     )
 
     # R4: conservación de flujo en centros.
     for s, f in sorted(active_sf):
         problem += (
-            SAL[s, f] + u[s, f]
-            == performance[f, s] * ING[s, f],
+            center_out_expr[s, f] + u[s, f] == (
+                performance[f, s] * center_in_expr[s, f]
+            ),
             f"R4_Flujo_Centro_{s}_{f}",
         )
 
     # R5: compatibilidad fracción-destino.
-    for d in D:
-        for f in F:
+    for d in destination_ids:
+        for f in fraction_ids:
             allowed = compatibility.get((f, d), 0)
             problem += (
-                ENT[d, f] <= allowed * capacity[d],
+                destination_in_expr[d, f] <= allowed * capacity[d],
                 f"R5_Compatibilidad_{d}_{f}",
             )
 
     # R6: capacidad máxima de destinos.
-    for d in D:
+    for d in destination_ids:
         problem += (
-            pulp.lpSum(ENT[d, f] for f in F) <= capacity[d],
+            pulp.lpSum(destination_in_expr[d, f] for f in fraction_ids) <= capacity[d],
             f"R6_Capacidad_{d}",
         )
 
     # R7: cuota mínima contractual.
-    for d in D_MIN:
+    for d in contract_destinations:
         if minimum[d] <= 0:
             continue
         if not contract_fractions[d]:
@@ -500,12 +506,12 @@ def build_model(data: Data):
             )
         problem += (
             pulp.lpSum(
-                ENT[d, f] for f in contract_fractions[d]
+                destination_in_expr[d, f] for f in contract_fractions[d]
             ) >= minimum[d],
             f"R7_Cuota_Minima_{d}",
         )
 
-    # R8: se implementa creando variables solo para ternas permitidas T.
+    # R8: se implementa creando variables solo para ternas permitidas transport_set.
 
     # R9: presupuesto global de emisiones.
     total_emissions = pulp.lpSum(
@@ -518,10 +524,10 @@ def build_model(data: Data):
     )
 
     expressions = {
-        "REC": REC,
-        "ING": ING,
-        "SAL": SAL,
-        "ENT": ENT,
+        "collected_expr": collected_expr,
+        "center_in_expr": center_in_expr,
+        "center_out_expr": center_out_expr,
+        "destination_in_expr": destination_in_expr,
         "total_emissions": total_emissions,
         "total_offer": total_offer,
         "theta": theta,
@@ -560,7 +566,7 @@ def print_solution(problem, x, u, expressions, status: str) -> None:
     objective = safe_value(problem.objective)
     emissions = safe_value(expressions["total_emissions"])
     collected = sum(
-        safe_value(value) for value in expressions["REC"].values()
+        safe_value(value) for value in expressions["collected_expr"].values()
     )
     total_offer = expressions["total_offer"]
     theta = expressions["theta"]
@@ -621,7 +627,7 @@ def save_solution(
         objective = safe_value(problem.objective)
         emissions = safe_value(expressions["total_emissions"])
         collected = sum(
-            safe_value(value) for value in expressions["REC"].values()
+            safe_value(value) for value in expressions["collected_expr"].values()
         )
         total_offer = expressions["total_offer"]
         theta = expressions["theta"]

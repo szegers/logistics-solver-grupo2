@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Set, Tuple
 
@@ -597,6 +598,81 @@ def print_solution(problem, x, u, expressions, status: str) -> None:
         print("  Sin descarte.")
 
 
+def save_solution(
+    folder: Path,
+    output_dir: Path,
+    problem,
+    x,
+    u,
+    expressions,
+    status: str,
+) -> Path:
+    """Guarda un resumen de la solución en un archivo de texto."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{folder.name}_solution.txt"
+
+    lines = [
+        "RESULTADO DEL SOLVER",
+        f"Instancia: {folder.name}",
+        f"Estado: {status}",
+    ]
+
+    if status == "Optimal":
+        objective = safe_value(problem.objective)
+        emissions = safe_value(expressions["total_emissions"])
+        collected = sum(
+            safe_value(value) for value in expressions["REC"].values()
+        )
+        total_offer = expressions["total_offer"]
+        theta = expressions["theta"]
+
+        lines.extend([
+            f"Utilidad óptima: $ {objective:,.2f}",
+            f"Oferta total: {total_offer:.3f} t",
+            f"Retiro total: {collected:.3f} t",
+            (
+                f"Meta REP mínima: {theta * total_offer:.3f} t "
+                f"({theta:.1%})"
+            ),
+            (
+                f"Emisiones: {emissions:.3f} kg CO2 / "
+                f"{expressions['emission_budget']:.3f} kg CO2"
+            ),
+            "",
+            "Flujos positivos:",
+        ])
+
+        positive_flows = 0
+        for (i, j, f, v), variable in sorted(x.items()):
+            amount = safe_value(variable)
+            if amount > 1e-7:
+                positive_flows += 1
+                lines.append(
+                    f"{i} -> {j} | {f} | {v}: {amount:.3f} t"
+                )
+
+        if positive_flows == 0:
+            lines.append("Sin flujos positivos.")
+
+        lines.extend(["", "Descarte en centros:"])
+        positive_discard = 0
+        for (s, f), variable in sorted(u.items()):
+            amount = safe_value(variable)
+            if amount > 1e-7:
+                positive_discard += 1
+                lines.append(f"{s} | {f}: {amount:.3f} t")
+
+        if positive_discard == 0:
+            lines.append("Sin descarte.")
+    else:
+        lines.append(
+            "No existe una solución óptima válida para esta instancia."
+        )
+
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return output_path
+
+
 def print_summary(folder: Path, data: Data) -> None:
     """Imprime un resumen de la instancia."""
     origins = data["origenes.csv"]
@@ -648,6 +724,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Muestra el log de CBC.",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("outputs"),
+        help="Carpeta donde se guarda el resumen de la solución.",
+    )
     return parser.parse_args()
 
 
@@ -670,6 +752,21 @@ def main() -> None:
     status = solve_model(problem, args.verbose)
     print_solution(problem, x, u, expressions, status)
 
+    output_path = save_solution(
+        folder,
+        args.output_dir,
+        problem,
+        x,
+        u,
+        expressions,
+        status,
+    )
+    print(f"\nResultado guardado en: {output_path}")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (FileNotFoundError, ValueError) as error:
+        print(f"\nERROR: {error}", file=sys.stderr)
+        raise SystemExit(2) from error

@@ -149,6 +149,56 @@ def validate_parameters(data: Data) -> None:
         raise ValueError("PresupuestoCarbono no puede ser negativo.")
 
 
+def parse_transport_row(
+    row: Row,
+    row_number: int,
+    origins: Dict[str, Row],
+    centers: Dict[str, Row],
+    destinations: Dict[str, Row],
+    trucks: Dict[str, Row],
+) -> Tuple[str, str, str, str, str]:
+    """Lee y valida una fila de caminos.csv."""
+    point = row["Origen"].strip()
+    center = row["Centro"].strip()
+    destination = row["Destino"].strip()
+    truck_first = row["CamionTramo1"].strip()
+    truck_second = row["CamionTramo2"].strip()
+
+    if point not in origins:
+        raise ValueError(
+            f"caminos.csv fila {row_number}: "
+            f"origen desconocido {point}."
+        )
+    if destination not in destinations:
+        raise ValueError(
+            f"caminos.csv fila {row_number}: "
+            f"destino desconocido {destination}."
+        )
+    if truck_first not in trucks:
+        raise ValueError(
+            f"caminos.csv fila {row_number}: "
+            f"camión desconocido {truck_first}."
+        )
+
+    if center:
+        if center not in centers:
+            raise ValueError(
+                f"caminos.csv fila {row_number}: "
+                f"centro desconocido {center}."
+            )
+        if truck_second not in trucks:
+            raise ValueError(
+                f"caminos.csv fila {row_number}: "
+                f"camión desconocido {truck_second}."
+            )
+    elif not is_one(origins[point]["PreClasificado"]):
+        raise ValueError(
+            f"{point} tiene camino directo pero PreClasificado != 1."
+        )
+
+    return point, center, destination, truck_first, truck_second
+
+
 def build_transport_set(
     data: Data,
     origins: Dict[str, Row],
@@ -156,361 +206,624 @@ def build_transport_set(
     destinations: Dict[str, Row],
     trucks: Dict[str, Row],
 ) -> Set[TransportKey]:
-    """Construye T=(i,j,v) desde caminos.csv.
-
-    Una fila con Centro genera dos tramos:
-    Origen->Centro y Centro->Destino.
-    Una fila sin Centro genera un tramo directo Origen->Destino.
-    """
+    """Construye las ternas de transporte permitidas (i, j, v)."""
     transport: Set[TransportKey] = set()
 
     for row_number, row in enumerate(data["caminos.csv"], start=2):
-        p = row["Origen"].strip()
-        s = row["Centro"].strip()
-        d = row["Destino"].strip()
-        v1 = row["CamionTramo1"].strip()
-        v2 = row["CamionTramo2"].strip()
+        point, center, destination, truck_first, truck_second = (
+            parse_transport_row(
+                row,
+                row_number,
+                origins,
+                centers,
+                destinations,
+                trucks,
+            )
+        )
 
-        if p not in origins:
-            raise ValueError(
-                f"caminos.csv fila {row_number}: origen desconocido {p}."
-            )
-        if d not in destinations:
-            raise ValueError(
-                f"caminos.csv fila {row_number}: destino desconocido {d}."
-            )
-        if v1 not in trucks:
-            raise ValueError(
-                f"caminos.csv fila {row_number}: camión desconocido {v1}."
-            )
-
-        if s:
-            if s not in centers:
-                raise ValueError(
-                    f"caminos.csv fila {row_number}: centro desconocido {s}."
-                )
-            if v2 not in trucks:
-                raise ValueError(
-                    f"caminos.csv fila {row_number}: "
-                    f"camión desconocido {v2}."
-                )
-            transport.add((p, s, v1))
-            transport.add((s, d, v2))
+        if center:
+            transport.add((point, center, truck_first))
+            transport.add((center, destination, truck_second))
         else:
-            if not is_one(origins[p]["PreClasificado"]):
-                raise ValueError(
-                    f"{p} tiene camino directo pero PreClasificado != 1."
-                )
-            transport.add((p, d, v1))
+            transport.add((point, destination, truck_first))
 
-    # En puntos restringidos solo se admite el tipo marcado como Urbano.
     filtered: Set[TransportKey] = set()
-    for i, j, v in transport:
-        if i in origins and is_one(origins[i]["AccesoRestringido"]):
-            if not is_one(trucks[v]["Urbano"]):
-                continue
-        filtered.add((i, j, v))
+    for origin, destination, truck in transport:
+        restricted = (
+            origin in origins
+            and is_one(origins[origin]["AccesoRestringido"])
+        )
+        if restricted and not is_one(trucks[truck]["Urbano"]):
+            continue
+        filtered.add((origin, destination, truck))
 
     return filtered
 
 
+def build_contract_fractions(
+    data: Data,
+    destinations: Dict[str, Row],
+    fractions: Dict[str, Row],
+    compatibility,
+):
+    """Construye y valida las fracciones que cuentan para contratos."""
+    contract_fractions = {d: set() for d in destinations}
+
+    for row in data["fracciones_contrato.csv"]:
+        destination = row["DestinoID"]
+        fraction = row["FraccionID"]
+
+        if destination not in destinations or fraction not in fractions:
+            raise ValueError(
+                "Par contractual desconocido: "
+                f"{destination}/{fraction}."
+            )
+        if compatibility.get((fraction, destination), 0) != 1:
+            raise ValueError(
+                f"{fraction} cuenta para contrato de {destination}, "
+                "pero no es compatible."
+            )
+        contract_fractions[destination].add(fraction)
+
+    return contract_fractions
+
+
+def validate_transport_data(
+    transport_set: Set[TransportKey],
+    transport_cost,
+    distance,
+) -> None:
+    """Valida costos y distancias para cada terna de transporte."""
+    for origin, destination, truck in transport_set:
+        if (origin, destination, truck) not in transport_cost:
+            raise ValueError(
+                "Falta costo de transporte para "
+                f"({origin}, {destination}, {truck})."
+            )
+        if (origin, destination) not in distance:
+            raise ValueError(
+                f"Falta distancia para ({origin}, {destination})."
+            )
+
+
+def build_origin_fraction_sets(
+    offer,
+    origins: Dict[str, Row],
+    fractions: Dict[str, Row],
+):
+    """Agrupa las fracciones con oferta disponible en cada origen."""
+    offered_by_origin = {point: set() for point in origins}
+
+    for (point, fraction), amount in offer.items():
+        if point not in origins or fraction not in fractions:
+            raise ValueError(
+                f"Oferta con clave desconocida: {point}/{fraction}."
+            )
+        if amount < 0:
+            raise ValueError(
+                f"Oferta negativa para {point}/{fraction}."
+            )
+        offered_by_origin[point].add(fraction)
+
+    return offered_by_origin
+
+
+def build_center_fraction_sets(
+    transport_set: Set[TransportKey],
+    origins: Dict[str, Row],
+    centers: Dict[str, Row],
+    offered_by_origin,
+):
+    """Determina qué fracciones pueden ingresar a cada centro."""
+    fractions_at_center = {center: set() for center in centers}
+
+    for origin, destination, _truck in transport_set:
+        if origin in origins and destination in centers:
+            fractions_at_center[destination].update(
+                offered_by_origin[origin]
+            )
+
+    return fractions_at_center
+
+
+def validate_performance(active_sf, performance) -> None:
+    """Valida que todo rendimiento requerido exista y esté entre 0 y 1."""
+    for center, fraction in active_sf:
+        if (fraction, center) not in performance:
+            raise ValueError(
+                f"Falta rendimiento para {fraction} en {center}."
+            )
+        if not 0 <= performance[fraction, center] <= 1:
+            raise ValueError(
+                "Rendimiento fuera de [0,1] para "
+                f"{fraction}/{center}."
+            )
+
+
+def create_flow_variables(
+    transport_set: Set[TransportKey],
+    origins: Dict[str, Row],
+    centers: Dict[str, Row],
+    destinations: Dict[str, Row],
+    offered_by_origin,
+    fractions_at_center,
+    compatibility,
+):
+    """Crea variables continuas solo para flujos factibles."""
+    flow_variables: Dict[FlowKey, pulp.LpVariable] = {}
+
+    for origin, destination, truck in sorted(transport_set):
+        if origin in origins:
+            candidate_fractions: Iterable[str] = (
+                offered_by_origin[origin]
+            )
+        elif origin in centers:
+            candidate_fractions = fractions_at_center[origin]
+        else:
+            continue
+
+        for fraction in candidate_fractions:
+            incompatible = (
+                destination in destinations
+                and compatibility.get(
+                    (fraction, destination),
+                    0,
+                ) != 1
+            )
+            if incompatible:
+                continue
+
+            flow_variables[
+                origin,
+                destination,
+                fraction,
+                truck,
+            ] = pulp.LpVariable(
+                f"x_{origin}_{destination}_{fraction}_{truck}",
+                lowBound=0,
+                cat="Continuous",
+            )
+
+    return flow_variables
+
+
+def flow_sum(
+    flow_variables,
+    origin=None,
+    destination=None,
+    fraction=None,
+):
+    """Suma variables de flujo que cumplen los filtros indicados."""
+    return pulp.lpSum(
+        variable
+        for (i, j, f, _truck), variable in flow_variables.items()
+        if all((
+            origin is None or i == origin,
+            destination is None or j == destination,
+            fraction is None or f == fraction,
+        ))
+    )
+
+
+def build_flow_expressions(
+    flow_variables,
+    offer,
+    active_sf,
+    destination_ids,
+    fraction_ids,
+):
+    """Construye expresiones auxiliares de retiro, ingreso y entrega."""
+    collected_expr = {
+        (point, fraction): flow_sum(
+            flow_variables,
+            origin=point,
+            fraction=fraction,
+        )
+        for point, fraction in offer
+    }
+    center_in_expr = {
+        (center, fraction): flow_sum(
+            flow_variables,
+            destination=center,
+            fraction=fraction,
+        )
+        for center, fraction in active_sf
+    }
+    center_out_expr = {
+        (center, fraction): flow_sum(
+            flow_variables,
+            origin=center,
+            fraction=fraction,
+        )
+        for center, fraction in active_sf
+    }
+    destination_in_expr = {
+        (destination, fraction): flow_sum(
+            flow_variables,
+            destination=destination,
+            fraction=fraction,
+        )
+        for destination in destination_ids
+        for fraction in fraction_ids
+    }
+
+    return (
+        collected_expr,
+        center_in_expr,
+        center_out_expr,
+        destination_in_expr,
+    )
+
+
+def add_collection_constraints(
+    problem,
+    offer,
+    collected_expr,
+    mandatory_origins,
+    theta,
+) -> float:
+    """Agrega disponibilidad, retiro obligatorio y Meta REP."""
+    for (point, fraction), available in offer.items():
+        problem += (
+            collected_expr[point, fraction] <= available,
+            f"R1_Disponibilidad_{point}_{fraction}",
+        )
+
+        if point in mandatory_origins:
+            problem += (
+                collected_expr[point, fraction] == available,
+                f"R2_Retiro_Obligatorio_{point}_{fraction}",
+            )
+
+    total_offer = sum(offer.values())
+    problem += (
+        pulp.lpSum(collected_expr.values()) >= theta * total_offer,
+        "R3_Meta_REP",
+    )
+    return total_offer
+
+
+def add_center_constraints(
+    problem,
+    active_sf,
+    center_out_expr,
+    center_in_expr,
+    discard_variables,
+    performance,
+) -> None:
+    """Agrega conservación de flujo en centros."""
+    for center, fraction in sorted(active_sf):
+        problem += (
+            center_out_expr[center, fraction]
+            + discard_variables[center, fraction]
+            == performance[fraction, center]
+            * center_in_expr[center, fraction],
+            f"R4_Flujo_Centro_{center}_{fraction}",
+        )
+
+
+def add_destination_constraints(
+    problem,
+    destination_ids,
+    fraction_ids,
+    destination_in_expr,
+    compatibility,
+    capacity,
+    contract_destinations,
+    minimum,
+    contract_fractions,
+) -> None:
+    """Agrega compatibilidad, capacidad y mínimos contractuales."""
+    for destination in destination_ids:
+        for fraction in fraction_ids:
+            allowed = compatibility.get((fraction, destination), 0)
+            problem += (
+                destination_in_expr[destination, fraction]
+                <= allowed * capacity[destination],
+                f"R5_Compatibilidad_{destination}_{fraction}",
+            )
+
+        problem += (
+            pulp.lpSum(
+                destination_in_expr[destination, fraction]
+                for fraction in fraction_ids
+            ) <= capacity[destination],
+            f"R6_Capacidad_{destination}",
+        )
+
+    for destination in contract_destinations:
+        if minimum[destination] <= 0:
+            continue
+        if not contract_fractions[destination]:
+            raise ValueError(
+                f"{destination} tiene cuota mínima, "
+                "pero no fracciones contractuales."
+            )
+
+        problem += (
+            pulp.lpSum(
+                destination_in_expr[destination, fraction]
+                for fraction in contract_fractions[destination]
+            ) >= minimum[destination],
+            f"R7_Cuota_Minima_{destination}",
+        )
+
+
 def build_model(data: Data):
     """Construye el problema LP, sus variables y expresiones auxiliares."""
-    origins = {r["OrigenID"]: r for r in data["origenes.csv"]}
-    centers = {r["CentroID"]: r for r in data["centros.csv"]}
-    destinations = {r["DestinoID"]: r for r in data["destinos.csv"]}
-    fractions = {r["FraccionID"]: r for r in data["fracciones.csv"]}
-    trucks = {r["CamionID"]: r for r in data["camiones.csv"]}
+    origins = {row["OrigenID"]: row for row in data["origenes.csv"]}
+    centers = {row["CentroID"]: row for row in data["centros.csv"]}
+    destinations = {
+        row["DestinoID"]: row
+        for row in data["destinos.csv"]
+    }
+    fractions = {
+        row["FraccionID"]: row
+        for row in data["fracciones.csv"]
+    }
+    trucks = {row["CamionID"]: row for row in data["camiones.csv"]}
 
-    P = list(origins)
-    S = list(centers)
-    D = list(destinations)
-    F = list(fractions)
+    point_ids = list(origins)
+    center_ids = list(centers)
+    destination_ids = list(destinations)
+    fraction_ids = list(fractions)
 
-    Q = {
-        (r["OrigenID"], r["FraccionID"]): as_float(
-            r["Toneladas"],
-            f"oferta.csv {r['OrigenID']}/{r['FraccionID']}",
+    offer = {
+        (row["OrigenID"], row["FraccionID"]): as_float(
+            row["Toneladas"],
+            (
+                "oferta.csv "
+                f"{row['OrigenID']}/{row['FraccionID']}"
+            ),
         )
-        for r in data["oferta.csv"]
+        for row in data["oferta.csv"]
     }
     compatibility = {
-        (r["FraccionID"], r["DestinoID"]): int(
-            as_float(r["Permitido"], "compatibilidad.csv Permitido")
+        (row["FraccionID"], row["DestinoID"]): int(
+            as_float(
+                row["Permitido"],
+                "compatibilidad.csv Permitido",
+            )
         )
-        for r in data["compatibilidad.csv"]
+        for row in data["compatibilidad.csv"]
     }
     destination_value = {
-        (r["FraccionID"], r["DestinoID"]): as_float(
-            r["Valor"], "valor_destino.csv Valor"
+        (row["FraccionID"], row["DestinoID"]): as_float(
+            row["Valor"],
+            "valor_destino.csv Valor",
         )
-        for r in data["valor_destino.csv"]
+        for row in data["valor_destino.csv"]
     }
     performance = {
-        (r["FraccionID"], r["CentroID"]): as_float(
-            r["Rendimiento"], "rendimiento.csv Rendimiento"
+        (row["FraccionID"], row["CentroID"]): as_float(
+            row["Rendimiento"],
+            "rendimiento.csv Rendimiento",
         )
-        for r in data["rendimiento.csv"]
+        for row in data["rendimiento.csv"]
     }
     transport_cost = {
-        (r["Desde"], r["Hasta"], r["CamionID"]): as_float(
-            r["CostoPorTonelada"],
+        (row["Desde"], row["Hasta"], row["CamionID"]): as_float(
+            row["CostoPorTonelada"],
             "costos_transporte.csv CostoPorTonelada",
         )
-        for r in data["costos_transporte.csv"]
+        for row in data["costos_transporte.csv"]
     }
     distance = {
-        (r["Desde"], r["Hasta"]): as_float(
-            r["Distancia"], "distancias.csv Distancia"
+        (row["Desde"], row["Hasta"]): as_float(
+            row["Distancia"],
+            "distancias.csv Distancia",
         )
-        for r in data["distancias.csv"]
+        for row in data["distancias.csv"]
     }
     parameters = {
-        r["Parametro"]: as_float(
-            r["Valor"], f"parametros.csv {r['Parametro']}"
+        row["Parametro"]: as_float(
+            row["Valor"],
+            f"parametros.csv {row['Parametro']}",
         )
-        for r in data["parametros.csv"]
+        for row in data["parametros.csv"]
     }
 
     theta = parameters["MetaREP"]
     emission_budget = parameters["PresupuestoCarbono"]
 
     beta = {
-        f: as_float(fractions[f]["BonoREP"], f"BonoREP {f}")
-        for f in F
+        fraction: as_float(
+            fractions[fraction]["BonoREP"],
+            f"BonoREP {fraction}",
+        )
+        for fraction in fraction_ids
     }
     center_cost = {
-        s: as_float(centers[s]["CostoManejo"], f"CostoManejo {s}")
-        for s in S
+        center: as_float(
+            centers[center]["CostoManejo"],
+            f"CostoManejo {center}",
+        )
+        for center in center_ids
     }
     emission_factor = {
-        v: as_float(trucks[v]["FactorEmision"], f"FactorEmision {v}")
-        for v in trucks
+        truck: as_float(
+            trucks[truck]["FactorEmision"],
+            f"FactorEmision {truck}",
+        )
+        for truck in trucks
     }
     capacity = {
-        d: as_float(
-            destinations[d]["CapacidadRecepcion"],
-            f"CapacidadRecepcion {d}",
+        destination: as_float(
+            destinations[destination]["CapacidadRecepcion"],
+            f"CapacidadRecepcion {destination}",
         )
-        for d in D
+        for destination in destination_ids
     }
     minimum = {
-        d: as_float(destinations[d]["CuotaMinima"], f"CuotaMinima {d}")
-        for d in D
+        destination: as_float(
+            destinations[destination]["CuotaMinima"],
+            f"CuotaMinima {destination}",
+        )
+        for destination in destination_ids
     }
 
-    P_OBL = {
-        p for p in P if is_one(origins[p]["RetiroObligatorio"])
+    mandatory_origins = {
+        point
+        for point in point_ids
+        if is_one(origins[point]["RetiroObligatorio"])
     }
-    S_CERT = {
-        s for s in S if is_one(centers[s]["Certificado"])
+    certified_centers = {
+        center
+        for center in center_ids
+        if is_one(centers[center]["Certificado"])
     }
-    D_MIN = {
-        d for d in D
-        if is_one(destinations[d]["Contrato"]) or minimum[d] > 0
+    contract_destinations = {
+        destination
+        for destination in destination_ids
+        if (
+            is_one(destinations[destination]["Contrato"])
+            or minimum[destination] > 0
+        )
     }
 
-    contract_fractions = {d: set() for d in D}
-    for r in data["fracciones_contrato.csv"]:
-        d = r["DestinoID"]
-        f = r["FraccionID"]
-        if d not in destinations or f not in fractions:
-            raise ValueError(
-                f"Par contractual desconocido: {d}/{f}."
-            )
-        if compatibility.get((f, d), 0) != 1:
-            raise ValueError(
-                f"{f} cuenta para contrato de {d}, pero no es compatible."
-            )
-        contract_fractions[d].add(f)
-
-    T = build_transport_set(
-        data, origins, centers, destinations, trucks
+    contract_fractions = build_contract_fractions(
+        data,
+        destinations,
+        fractions,
+        compatibility,
+    )
+    transport_set = build_transport_set(
+        data,
+        origins,
+        centers,
+        destinations,
+        trucks,
+    )
+    validate_transport_data(
+        transport_set,
+        transport_cost,
+        distance,
     )
 
-    for i, j, v in T:
-        if (i, j, v) not in transport_cost:
-            raise ValueError(
-                f"Falta costo de transporte para ({i}, {j}, {v})."
-            )
-        if (i, j) not in distance:
-            raise ValueError(
-                f"Falta distancia para ({i}, {j})."
-            )
-
-    offered_by_origin = {p: set() for p in P}
-    for (p, f), amount in Q.items():
-        if p not in origins or f not in fractions:
-            raise ValueError(f"Oferta con clave desconocida: {p}/{f}.")
-        if amount < 0:
-            raise ValueError(f"Oferta negativa para {p}/{f}.")
-        offered_by_origin[p].add(f)
-
-    fractions_at_center = {s: set() for s in S}
-    for p, s, _v in T:
-        if p in origins and s in centers:
-            fractions_at_center[s].update(offered_by_origin[p])
-
+    offered_by_origin = build_origin_fraction_sets(
+        offer,
+        origins,
+        fractions,
+    )
+    fractions_at_center = build_center_fraction_sets(
+        transport_set,
+        origins,
+        centers,
+        offered_by_origin,
+    )
     active_sf = {
-        (s, f)
-        for s in S
-        for f in fractions_at_center[s]
+        (center, fraction)
+        for center in center_ids
+        for fraction in fractions_at_center[center]
     }
-    for s, f in active_sf:
-        if (f, s) not in performance:
-            raise ValueError(
-                f"Falta rendimiento para {f} en {s}."
-            )
-        if not 0 <= performance[f, s] <= 1:
-            raise ValueError(
-                f"Rendimiento fuera de [0,1] para {f}/{s}."
-            )
+    validate_performance(active_sf, performance)
 
     problem = pulp.LpProblem(
-        "Reverse_Logistics_Textile", pulp.LpMaximize
+        "Reverse_Logistics_Textile",
+        pulp.LpMaximize,
     )
-
-    x: Dict[FlowKey, pulp.LpVariable] = {}
-    for i, j, v in sorted(T):
-        if i in origins:
-            candidate_fractions: Iterable[str] = offered_by_origin[i]
-        elif i in centers:
-            candidate_fractions = fractions_at_center[i]
-        else:
-            continue
-
-        for f in candidate_fractions:
-            if j in destinations and compatibility.get((f, j), 0) != 1:
-                continue
-            x[i, j, f, v] = pulp.LpVariable(
-                f"x_{i}_{j}_{f}_{v}",
-                lowBound=0,
-                cat="Continuous",
-            )
-
-    u = {
-        (s, f): pulp.LpVariable(
-            f"u_{s}_{f}", lowBound=0, cat="Continuous"
+    flow_variables = create_flow_variables(
+        transport_set,
+        origins,
+        centers,
+        destinations,
+        offered_by_origin,
+        fractions_at_center,
+        compatibility,
+    )
+    discard_variables = {
+        (center, fraction): pulp.LpVariable(
+            f"u_{center}_{fraction}",
+            lowBound=0,
+            cat="Continuous",
         )
-        for s, f in sorted(active_sf)
+        for center, fraction in sorted(active_sf)
     }
 
-    def flow_sum(origin=None, destination=None, fraction=None):
-        return pulp.lpSum(
-            variable
-            for (i, j, f, _v), variable in x.items()
-            if (origin is None or i == origin)
-            and (destination is None or j == destination)
-            and (fraction is None or f == fraction)
-        )
-
-    REC = {
-        (p, f): flow_sum(origin=p, fraction=f)
-        for p, f in Q
-    }
-    ING = {
-        (s, f): flow_sum(destination=s, fraction=f)
-        for s, f in active_sf
-    }
-    SAL = {
-        (s, f): flow_sum(origin=s, fraction=f)
-        for s, f in active_sf
-    }
-    ENT = {
-        (d, f): flow_sum(destination=d, fraction=f)
-        for d in D for f in F
-    }
+    (
+        collected_expr,
+        center_in_expr,
+        center_out_expr,
+        destination_in_expr,
+    ) = build_flow_expressions(
+        flow_variables,
+        offer,
+        active_sf,
+        destination_ids,
+        fraction_ids,
+    )
 
     value_term = pulp.lpSum(
-        destination_value.get((f, d), 0.0) * ENT[d, f]
-        for d in D for f in F
+        destination_value.get((fraction, destination), 0.0)
+        * destination_in_expr[destination, fraction]
+        for destination in destination_ids
+        for fraction in fraction_ids
     )
     rep_term = pulp.lpSum(
-        beta[f] * SAL[s, f]
-        for s in S_CERT
-        for f in fractions_at_center[s]
-        if (s, f) in SAL
+        beta[fraction] * center_out_expr[center, fraction]
+        for center in certified_centers
+        for fraction in fractions_at_center[center]
+        if (center, fraction) in center_out_expr
     )
     classification_term = pulp.lpSum(
-        center_cost[s] * ING[s, f]
-        for s, f in active_sf
+        center_cost[center] * center_in_expr[center, fraction]
+        for center, fraction in active_sf
     )
     transport_term = pulp.lpSum(
-        transport_cost[i, j, v] * variable
-        for (i, j, _f, v), variable in x.items()
+        transport_cost[origin, destination, truck] * variable
+        for (
+            origin,
+            destination,
+            _fraction,
+            truck,
+        ), variable in flow_variables.items()
     )
 
     problem += (
-        value_term + rep_term - classification_term - transport_term
-    ), "Utilidad_Total"
-
-    # R1: disponibilidad.
-    for (p, f), available in Q.items():
-        problem += (
-            REC[p, f] <= available,
-            f"R1_Disponibilidad_{p}_{f}",
-        )
-
-    # R2: retiro total obligatorio.
-    for (p, f), available in Q.items():
-        if p in P_OBL:
-            problem += (
-                REC[p, f] == available,
-                f"R2_Retiro_Obligatorio_{p}_{f}",
-            )
-
-    # R3: meta mínima REP.
-    total_offer = sum(Q.values())
-    problem += (
-        pulp.lpSum(REC.values()) >= theta * total_offer,
-        "R3_Meta_REP",
+        value_term
+        + rep_term
+        - classification_term
+        - transport_term,
+        "Utilidad_Total",
     )
 
-    # R4: conservación de flujo en centros.
-    for s, f in sorted(active_sf):
-        problem += (
-            SAL[s, f] + u[s, f]
-            == performance[f, s] * ING[s, f],
-            f"R4_Flujo_Centro_{s}_{f}",
-        )
+    total_offer = add_collection_constraints(
+        problem,
+        offer,
+        collected_expr,
+        mandatory_origins,
+        theta,
+    )
+    add_center_constraints(
+        problem,
+        active_sf,
+        center_out_expr,
+        center_in_expr,
+        discard_variables,
+        performance,
+    )
+    add_destination_constraints(
+        problem,
+        destination_ids,
+        fraction_ids,
+        destination_in_expr,
+        compatibility,
+        capacity,
+        contract_destinations,
+        minimum,
+        contract_fractions,
+    )
 
-    # R5: compatibilidad fracción-destino.
-    for d in D:
-        for f in F:
-            allowed = compatibility.get((f, d), 0)
-            problem += (
-                ENT[d, f] <= allowed * capacity[d],
-                f"R5_Compatibilidad_{d}_{f}",
-            )
-
-    # R6: capacidad máxima de destinos.
-    for d in D:
-        problem += (
-            pulp.lpSum(ENT[d, f] for f in F) <= capacity[d],
-            f"R6_Capacidad_{d}",
-        )
-
-    # R7: cuota mínima contractual.
-    for d in D_MIN:
-        if minimum[d] <= 0:
-            continue
-        if not contract_fractions[d]:
-            raise ValueError(
-                f"{d} tiene cuota mínima, pero no fracciones contractuales."
-            )
-        problem += (
-            pulp.lpSum(
-                ENT[d, f] for f in contract_fractions[d]
-            ) >= minimum[d],
-            f"R7_Cuota_Minima_{d}",
-        )
-
-    # R8: se implementa creando variables solo para ternas permitidas T.
-
-    # R9: presupuesto global de emisiones.
     total_emissions = pulp.lpSum(
-        variable * emission_factor[v] * distance[i, j]
-        for (i, j, _f, v), variable in x.items()
+        variable
+        * emission_factor[truck]
+        * distance[origin, destination]
+        for (
+            origin,
+            destination,
+            _fraction,
+            truck,
+        ), variable in flow_variables.items()
     )
     problem += (
         total_emissions <= emission_budget,
@@ -518,16 +831,21 @@ def build_model(data: Data):
     )
 
     expressions = {
-        "REC": REC,
-        "ING": ING,
-        "SAL": SAL,
-        "ENT": ENT,
+        "collected_expr": collected_expr,
+        "center_in_expr": center_in_expr,
+        "center_out_expr": center_out_expr,
+        "destination_in_expr": destination_in_expr,
         "total_emissions": total_emissions,
         "total_offer": total_offer,
         "theta": theta,
         "emission_budget": emission_budget,
     }
-    return problem, x, u, expressions
+    return (
+        problem,
+        flow_variables,
+        discard_variables,
+        expressions,
+    )
 
 
 def solve_model(problem: pulp.LpProblem, verbose: bool) -> str:
@@ -560,7 +878,7 @@ def print_solution(problem, x, u, expressions, status: str) -> None:
     objective = safe_value(problem.objective)
     emissions = safe_value(expressions["total_emissions"])
     collected = sum(
-        safe_value(value) for value in expressions["REC"].values()
+        safe_value(value) for value in expressions["collected_expr"].values()
     )
     total_offer = expressions["total_offer"]
     theta = expressions["theta"]
@@ -621,7 +939,8 @@ def save_solution(
         objective = safe_value(problem.objective)
         emissions = safe_value(expressions["total_emissions"])
         collected = sum(
-            safe_value(value) for value in expressions["REC"].values()
+            safe_value(value)
+            for value in expressions["collected_expr"].values()
         )
         total_offer = expressions["total_offer"]
         theta = expressions["theta"]
@@ -742,22 +1061,30 @@ def main() -> None:
     validate_parameters(data)
     print_summary(folder, data)
 
-    problem, x, u, expressions = build_model(data)
+    problem, flow_variables, discard_variables, expressions = (
+        build_model(data)
+    )
     print(
-        f"\nModelo construido: {len(x)} variables de flujo, "
-        f"{len(u)} variables de descarte y "
+        f"\nModelo construido: {len(flow_variables)} variables de flujo, "
+        f"{len(discard_variables)} variables de descarte y "
         f"{len(problem.constraints)} restricciones."
     )
 
     status = solve_model(problem, args.verbose)
-    print_solution(problem, x, u, expressions, status)
+    print_solution(
+        problem,
+        flow_variables,
+        discard_variables,
+        expressions,
+        status,
+    )
 
     output_path = save_solution(
         folder,
         args.output_dir,
         problem,
-        x,
-        u,
+        flow_variables,
+        discard_variables,
         expressions,
         status,
     )

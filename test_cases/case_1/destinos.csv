@@ -1,0 +1,4 @@
+DestinoID;Nombre;Tipo;Relleno;CapacidadRecepcion;Contrato;CuotaMinima
+D1;Hilanderia propia;fibra;0;100;1;5
+D2;Planta no tejidos;reciclaje;0;60;0;0
+D3;Relleno sanitario;disposicion;1;9999;0;0

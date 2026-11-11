@@ -1,0 +1,3 @@
+DestinoID;Nombre;Tipo;Relleno;CapacidadRecepcion;Contrato;CuotaMinima
+D1;Tienda de reutilizacion;reutilizacion;0;50;1;5
+D2;Relleno sanitario;disposicion;1;9999;0;0

@@ -1,0 +1,4 @@
+OrigenID;Tipo;RetiroObligatorio;PreClasificado;AccesoRestringido;CostoRecoleccion
+O01;Buzon tienda;0;0;0;0
+O02;Taller confeccion;0;1;0;0
+O03;Cliente institucional;0;0;0;0

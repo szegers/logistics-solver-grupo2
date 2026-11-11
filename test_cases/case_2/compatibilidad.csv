@@ -1,0 +1,7 @@
+FraccionID;DestinoID;Permitido
+F01;D1;1
+F01;D2;0
+F01;D3;1
+F02;D1;0
+F02;D2;1
+F02;D3;1

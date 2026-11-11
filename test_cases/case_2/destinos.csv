@@ -1,0 +1,4 @@
+DestinoID;Nombre;Tipo;Relleno;CapacidadRecepcion;Contrato;CuotaMinima
+D1;Tienda de reutilizacion;reutilizacion;0;50;0;0
+D2;Hilanderia propia;fibra;0;20;1;4
+D3;Relleno sanitario;disposicion;1;9999;0;0
